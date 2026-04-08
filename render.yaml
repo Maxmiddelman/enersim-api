@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: enersim-api
+    env: python
+    plan: starter
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - fromGroup: enersim-shared
+
+  - type: cron
+    name: weather-sync
+    env: python
+    plan: starter
+    region: frankfurt
+    schedule: "0 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.weather_sync
+    envVars:
+      - fromGroup: enersim-shared
+
+envVarGroups:
+  - name: enersim-shared
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DEFAULT_TIMEZONE
+        value: Europe/Amsterdam
