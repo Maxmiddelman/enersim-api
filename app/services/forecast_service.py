@@ -3,28 +3,8 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 
 from app.db import supabase
-from app.config import (
-    FORECAST_HORIZON_QUARTERS,
-    LSTM_SEQUENCE_LENGTH,
-    PV_LOOKBACK_DAYS,
-    LOAD_LOOKBACK_DAYS,
-)
-from app.models.pv_model import PVModel
-from app.models.load_lstm import LoadLSTMForecaster
-from app.utils.features import (
-    build_quarter_weather_from_hourly,
-    merge_measurements_and_weather,
-    add_lag_features,
-    add_rolling_features,
-)
 
-# In-memory cache voor snelheid
 MODEL_CACHE = {}
-
-
-def _fetch_site(site_id: str):
-    result = supabase.table("sites").select("*").eq("id", site_id).single().execute()
-    return result.data
 
 
 def _fetch_measurements(site_id: str, start_ts: datetime, end_ts: datetime) -> pd.DataFrame:
@@ -32,30 +12,14 @@ def _fetch_measurements(site_id: str, start_ts: datetime, end_ts: datetime) -> p
         supabase.table("site_measurements_15m")
         .select("*")
         .eq("site_id", site_id)
-        .gte("timestamp", start_ts.isoformat())
-        .lte("timestamp", end_ts.isoformat())
-        .order("timestamp")
+        .gte("ts_utc", start_ts.isoformat())
+        .lte("ts_utc", end_ts.isoformat())
+        .order("ts_utc")
         .execute()
     )
     df = pd.DataFrame(result.data or [])
     if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    return df
-
-
-def _fetch_weather_history(site_id: str, start_ts: datetime, end_ts: datetime) -> pd.DataFrame:
-    result = (
-        supabase.table("weather_history_hourly")
-        .select("*")
-        .eq("site_id", site_id)
-        .gte("timestamp", start_ts.isoformat())
-        .lte("timestamp", end_ts.isoformat())
-        .order("timestamp")
-        .execute()
-    )
-    df = pd.DataFrame(result.data or [])
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True)
     return df
 
 
@@ -64,104 +28,163 @@ def _fetch_weather_forecast(site_id: str, start_ts: datetime, end_ts: datetime) 
         supabase.table("weather_forecast_hourly")
         .select("*")
         .eq("site_id", site_id)
-        .gte("timestamp", start_ts.isoformat())
-        .lte("timestamp", end_ts.isoformat())
-        .order("timestamp")
+        .gte("ts_utc", start_ts.isoformat())
+        .lte("ts_utc", end_ts.isoformat())
+        .order("ts_utc")
         .execute()
     )
     df = pd.DataFrame(result.data or [])
     if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True)
     return df
 
 
-def _build_training_frame(site_id: str):
+def _quarter_index(ts: pd.Series) -> pd.Series:
+    return ts.dt.hour * 4 + (ts.dt.minute // 15)
+
+
+def _similar_day_load_forecast(df: pd.DataFrame) -> np.ndarray:
+    df = df.sort_values("ts_utc").reset_index(drop=True)
+
+    # Gebruik laatste 4 weken als mogelijk
+    if len(df) >= 96 * 28:
+        last_4_weeks = df["power_kw"].tail(96 * 28).values.reshape(28, 96)
+        return np.mean(last_4_weeks, axis=0)
+
+    # fallback: laatste 7 dagen
+    if len(df) >= 96 * 7:
+        last_week = df["power_kw"].tail(96 * 7).values.reshape(7, 96)
+        return np.mean(last_week, axis=0)
+
+    # fallback: laatste dag
+    if len(df) >= 96:
+        return df["power_kw"].tail(96).values
+
+    # fallback: gemiddelde
+    avg = df["power_kw"].mean() if len(df) > 0 else 0.0
+    return np.full(96, avg)
+
+
+def _load_confidence(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    df = df.sort_values("ts_utc").reset_index(drop=True)
+
+    if len(df) >= 96 * 7:
+        values = df["power_kw"].tail(96 * 7).values.reshape(7, 96)
+        center = np.mean(values, axis=0)
+        spread = np.std(values, axis=0)
+    else:
+        center = _similar_day_load_forecast(df)
+        spread = np.full(96, np.std(df["power_kw"].values) if len(df) > 10 else 0.25)
+
+    lower = center - spread
+    upper = center + spread
+    return lower, upper
+
+
+def _estimate_pv_from_weather(weather_df: pd.DataFrame, site_metadata: dict | None) -> np.ndarray:
+    """
+    Eenvoudige eerste PV forecast:
+    op basis van GHI en eventueel pv_capacity uit metadata.
+    """
+    if weather_df.empty:
+        return np.zeros(96)
+
+    pv_capacity_kwp = 0.0
+    if site_metadata:
+        pv_capacity_kwp = float(site_metadata.get("pv_capacity_kwp", 0.0) or 0.0)
+
+    # Als geen capacity bekend is, schat PV voorlopig op 0
+    if pv_capacity_kwp <= 0:
+        return np.zeros(96)
+
+    # Hourly GHI naar kwartieren
+    ghi = weather_df["ghi_wm2"].fillna(0).values
+    ghi_q = np.repeat(ghi, 4)[:96]
+
+    # Eenvoudige omzetting:
+    # bij 1000 W/m2 ongeveer rond nominale piek
+    pv_kw = pv_capacity_kwp * (ghi_q / 1000.0)
+
+    # begrens
+    pv_kw = np.clip(pv_kw, 0, pv_capacity_kwp)
+    return pv_kw
+
+
+def _estimate_ev_baseline(df: pd.DataFrame) -> np.ndarray:
+    if len(df) >= 96 * 7:
+        ev = df["metadata"].apply(lambda x: x.get("ev_kw", 0) if isinstance(x, dict) else 0).values
+        ev = ev[-96 * 7:].reshape(7, 96)
+        return np.mean(ev, axis=0)
+
+    return np.zeros(96)
+
+
+def _fetch_latest_metadata(site_id: str):
+    result = (
+        supabase.table("site_measurements_15m")
+        .select("metadata")
+        .eq("site_id", site_id)
+        .order("ts_utc", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        return None
+    return rows[0].get("metadata")
+
+
+def _save_forecast(site_id: str, load_fc: np.ndarray, pv_fc: np.ndarray, ev_fc: np.ndarray,
+                   lower: np.ndarray, upper: np.ndarray, model_id: str):
     now = datetime.now(timezone.utc)
-    load_start = now - timedelta(days=LOAD_LOOKBACK_DAYS)
-    pv_start = now - timedelta(days=PV_LOOKBACK_DAYS)
+    start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
 
-    measurements = _fetch_measurements(site_id, load_start, now)
-    weather_hist = _fetch_weather_history(site_id, load_start, now)
+    rows = []
+    for i in range(96):
+        ts = start + timedelta(minutes=15 * i)
+        net_fc = float(load_fc[i] - pv_fc[i] + ev_fc[i])
 
-    if measurements.empty:
-        raise ValueError("Geen metingen gevonden voor deze site.")
-    if weather_hist.empty:
-        raise ValueError("Geen historische weather gevonden voor deze site.")
+        rows.append({
+            "site_id": site_id,
+            "ts_utc": ts.isoformat(),
+            "model_id": model_id,
+            "predicted_power_kw": net_fc,          # legacy compat
+            "predicted_load_kw": float(load_fc[i]),
+            "predicted_pv_kw": float(pv_fc[i]),
+            "predicted_ev_kw": float(ev_fc[i]),
+            "predicted_net_kw": net_fc,
+            "confidence_lower": float(lower[i]),
+            "confidence_upper": float(upper[i]),
+            "forecast_type": "day_ahead",
+            "metadata": {
+                "source": "enersim-api",
+                "version": model_id
+            }
+        })
 
-    weather_q = build_quarter_weather_from_hourly(weather_hist)
-    df = merge_measurements_and_weather(measurements, weather_q)
-
-    df = add_lag_features(df, "load_kw", [1, 2, 4, 96, 192, 672])
-    df = add_rolling_features(df, "load_kw", [4, 12, 96])
-
-    df = df.ffill().bfill().dropna().reset_index(drop=True)
-    return df
+    supabase.table("forecast_predictions_15m").upsert(rows).execute()
 
 
 def train_models_for_site(site_id: str):
-    site = _fetch_site(site_id)
-    if not site:
-        return {"error": "site not found"}
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=365)
 
-    df = _build_training_frame(site_id)
-
-    # PV model
-    pv_model = PVModel()
-    pv_feature_cols = [
-        "shortwave_radiation",
-        "temperature_2m",
-        "cloud_cover",
-        "sin_qod",
-        "cos_qod",
-        "sin_doy",
-        "cos_doy",
-        "is_weekend",
-    ]
-
-    pv_train = df[pd.notnull(df["pv_kw"])].copy()
-    pv_model.fit(pv_train[pv_feature_cols], pv_train["pv_kw"])
-    pv_pred_train = pv_model.predict(pv_train[pv_feature_cols])
-
-    # Voeg pv voorspelling toe als feature voor load
-    df["pv_pred_hist"] = pv_model.predict(df[pv_feature_cols])
-
-    load_feature_cols = [
-        "load_kw",
-        "pv_pred_hist",
-        "ev_kw",
-        "temperature_2m",
-        "cloud_cover",
-        "sin_qod",
-        "cos_qod",
-        "sin_dow",
-        "cos_dow",
-        "load_kw_lag_1",
-        "load_kw_lag_4",
-        "load_kw_lag_96",
-        "load_kw_roll_mean_4",
-        "load_kw_roll_mean_12",
-        "load_kw_roll_mean_96",
-    ]
-
-    lstm = LoadLSTMForecaster(
-        sequence_length=LSTM_SEQUENCE_LENGTH,
-        horizon_steps=FORECAST_HORIZON_QUARTERS,
-    )
-    lstm.fit(df, load_feature_cols, epochs=8, batch_size=64, lr=0.001)
+    df = _fetch_measurements(site_id, start, now)
+    if df.empty:
+        return {"error": "geen meetdata gevonden"}
 
     MODEL_CACHE[site_id] = {
-        "pv_model": pv_model,
-        "load_lstm": lstm,
-        "pv_feature_cols": pv_feature_cols,
-        "load_feature_cols": load_feature_cols,
-        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ready",
+        "trained_at": now.isoformat(),
+        "rows_used": len(df),
+        "model_id": "similar_day_plus_weather_v1",
     }
 
     return {
         "site_id": site_id,
         "status": "trained",
         "rows_used": len(df),
-        "pv_train_mae": float(np.mean(np.abs(pv_train["pv_kw"].values - pv_pred_train))),
+        "model_id": "similar_day_plus_weather_v1",
     }
 
 
@@ -170,105 +193,42 @@ def _ensure_models(site_id: str):
         train_models_for_site(site_id)
 
 
-def _make_future_feature_frame(site_id: str, recent_df: pd.DataFrame):
-    now = datetime.now(timezone.utc)
-    horizon_end = now + timedelta(minutes=15 * FORECAST_HORIZON_QUARTERS)
-
-    weather_fc = _fetch_weather_forecast(site_id, now - timedelta(hours=1), horizon_end)
-    if weather_fc.empty:
-        raise ValueError("Geen weather forecast beschikbaar.")
-
-    weather_q = build_quarter_weather_from_hourly(weather_fc)
-
-    future = weather_q[["timestamp", "temperature_2m", "cloud_cover", "shortwave_radiation"]].copy()
-    future = future.sort_values("timestamp").head(FORECAST_HORIZON_QUARTERS).reset_index(drop=True)
-
-    # Tijdfeatures toevoegen via merge helper
-    empty_measurements = pd.DataFrame({
-        "timestamp": future["timestamp"],
-        "load_kw": [recent_df["load_kw"].iloc[-1]] * len(future),
-        "pv_kw": [0.0] * len(future),
-        "ev_kw": [recent_df["ev_kw"].iloc[-96:].mean() if len(recent_df) >= 96 else 0.0] * len(future),
-    })
-
-    merged = merge_measurements_and_weather(empty_measurements, future)
-    return merged
-
-
-def _save_predictions(site_id: str, pred_df: pd.DataFrame):
-    rows = pred_df.to_dict(orient="records")
-    if rows:
-        supabase.table("forecast_predictions_15m").upsert(rows).execute()
-
-
 def run_forecast_for_site(site_id: str):
     _ensure_models(site_id)
 
-    models = MODEL_CACHE[site_id]
-    pv_model = models["pv_model"]
-    lstm = models["load_lstm"]
-    pv_feature_cols = models["pv_feature_cols"]
-    load_feature_cols = models["load_feature_cols"]
-
     now = datetime.now(timezone.utc)
-    hist_start = now - timedelta(days=14)
-    recent_df = _fetch_measurements(site_id, hist_start, now)
-    weather_hist = _fetch_weather_history(site_id, hist_start, now)
+    hist_start = now - timedelta(days=60)
+    horizon_end = now + timedelta(hours=24)
 
-    if recent_df.empty or weather_hist.empty:
-        return {"error": "te weinig recente data"}
+    measurements = _fetch_measurements(site_id, hist_start, now)
+    if measurements.empty:
+        return {"error": "geen meetdata gevonden"}
 
-    weather_q = build_quarter_weather_from_hourly(weather_hist)
-    recent_df = merge_measurements_and_weather(recent_df, weather_q)
-    recent_df = add_lag_features(recent_df, "load_kw", [1, 2, 4, 96, 192, 672])
-    recent_df = add_rolling_features(recent_df, "load_kw", [4, 12, 96])
-    recent_df = recent_df.ffill().bfill().dropna().reset_index(drop=True)
+    weather_fc = _fetch_weather_forecast(site_id, now - timedelta(hours=1), horizon_end)
+    if weather_fc.empty:
+        return {"error": "geen weather forecast gevonden"}
 
-    future_df = _make_future_feature_frame(site_id, recent_df)
+    metadata = _fetch_latest_metadata(site_id)
 
-    # PV forecast
-    pv_future = pv_model.predict(future_df[pv_feature_cols])
-    future_df["pv_pred_hist"] = pv_future
+    load_fc = _similar_day_load_forecast(measurements)
+    lower, upper = _load_confidence(measurements)
+    pv_fc = _estimate_pv_from_weather(weather_fc, metadata)
+    ev_fc = _estimate_ev_baseline(measurements)
 
-    # EV baseline = gemiddelde zelfde kwartier van laatste 7 dagen
-    recent_ev = recent_df.tail(96 * 7)["ev_kw"].values
-    if len(recent_ev) >= 96:
-        ev_template = recent_ev[-96:]
-    else:
-        ev_template = np.zeros(96)
-
-    future_df["ev_kw"] = ev_template[: len(future_df)]
-
-    # Voor load LSTM hebben we een frame nodig met laatste geschiedenis + future feature rows
-    combined = pd.concat([recent_df, future_df], ignore_index=True, sort=False)
-
-    # Lags/rolling opnieuw over combined zodat future rows ook features hebben
-    combined["pv_pred_hist"] = combined["pv_pred_hist"].ffill().bfill()
-    combined = add_lag_features(combined, "load_kw", [1, 2, 4, 96, 192, 672])
-    combined = add_rolling_features(combined, "load_kw", [4, 12, 96])
-
-    combined = combined.ffill().bfill()
-
-    load_preds = lstm.predict(combined)
-
-    result = future_df[["timestamp"]].copy()
-    result["site_id"] = site_id
-    result["pred_load_kw"] = load_preds[: len(result)]
-    result["pred_pv_kw"] = pv_future[: len(result)]
-    result["pred_ev_kw"] = future_df["ev_kw"].values[: len(result)]
-    result["pred_net_kw"] = result["pred_load_kw"] - result["pred_pv_kw"] + result["pred_ev_kw"]
-
-    result["generated_at"] = datetime.now(timezone.utc).isoformat()
-    result["load_model_version"] = "lstm_v1"
-    result["pv_model_version"] = "gbr_v1"
-    result["ev_model_version"] = "baseline_v1"
-
-    _save_predictions(site_id, result)
+    model_id = MODEL_CACHE[site_id]["model_id"]
+    _save_forecast(site_id, load_fc, pv_fc, ev_fc, lower, upper, model_id)
 
     return {
         "site_id": site_id,
         "status": "forecast_created",
-        "rows_written": len(result),
-        "trained_at": models["trained_at"],
-        "sample": result.head(5).to_dict(orient="records"),
+        "model_id": model_id,
+        "rows_written": 96,
+        "sample": [
+            {
+                "predicted_load_kw": float(load_fc[0]),
+                "predicted_pv_kw": float(pv_fc[0]),
+                "predicted_ev_kw": float(ev_fc[0]),
+                "predicted_net_kw": float(load_fc[0] - pv_fc[0] + ev_fc[0]),
+            }
+        ]
     }
