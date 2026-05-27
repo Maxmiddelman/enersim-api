@@ -305,4 +305,3 @@ def run_forecast_for_site(site_id: str):
             }
         ]
     }
-    }
