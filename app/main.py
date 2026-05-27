@@ -21,6 +21,14 @@ app.add_middleware(
 class SiteRequest(BaseModel):
     site_id: str
 
+@app.get("/")
+def root():
+    return {"status": "online"}
+
+@app.head("/")
+def root_head():
+    return
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
