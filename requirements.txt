@@ -4,6 +4,3 @@ requests
 supabase
 pandas
 numpy
-scikit-learn
-torch
-joblib
