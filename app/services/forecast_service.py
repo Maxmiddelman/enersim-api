@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from app.db import supabase
+from app.models.improved_forecast import DataProcessor, LSTMWithAttention, train_model, predict_future
 
 MODEL_CACHE = {}
 
