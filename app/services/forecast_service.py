@@ -324,4 +324,3 @@ def _save_forecast(site_id: str, load_fc: np.ndarray, pv_fc: np.ndarray, ev_fc: 
             }
         })
     supabase.table("forecast_predictions_15m").upsert(rows).execute()
-
