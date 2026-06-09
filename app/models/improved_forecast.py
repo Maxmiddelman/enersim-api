@@ -57,7 +57,41 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+# We implement a simple scaler to avoid dependence on scikit-learn.  It behaves
+# similar aan StandardScaler: het berekent de mean en std per feature en
+# schaalt data volgens (x - mean) / std.  Hierdoor hebben we geen externe
+# dependency zoals scikit-learn nodig, wat handig is in deployment omgevingen
+# waar scikit-learn niet beschikbaar is.
+
+
+class SimpleScaler:
+    """Eenvoudige schaaltransformatie zonder externe afhankelijkheden.
+
+    De scaler berekent voor elke feature de gemiddelde en standaardafwijking.
+    Tijdens transformeren wordt (x - mean) / std toegepast.  Een std van 0
+    wordt vervangen door 1 om deling door nul te voorkomen.
+    """
+
+    def __init__(self) -> None:
+        self.mean_: Optional[np.ndarray] = None
+        self.std_: Optional[np.ndarray] = None
+
+    def fit(self, X: np.ndarray) -> 'SimpleScaler':
+        """Bereken mean en std voor de kolommen."""
+        self.mean_ = np.nanmean(X, axis=0)
+        self.std_ = np.nanstd(X, axis=0)
+        # Vervang nullen in std door 1 om deling door nul te voorkomen
+        self.std_ = np.where(self.std_ == 0, 1.0, self.std_)
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        if self.mean_ is None or self.std_ is None:
+            raise RuntimeError("Scaler is not fitted")
+        return (X - self.mean_) / self.std_
+
+    def fit_transform(self, X: np.ndarray) -> np.ndarray:
+        self.fit(X)
+        return self.transform(X)
 import torch
 import torch.nn as nn
 
@@ -326,7 +360,7 @@ def train_model(df: pd.DataFrame,
                 hidden_dim: int = 64,
                 num_layers: int = 2,
                 lr: float = 0.001,
-                device: Optional[str] = None) -> Tuple[LSTMWithAttention, StandardScaler]:
+                device: Optional[str] = None) -> Tuple[LSTMWithAttention, SimpleScaler]:
     """Trainde het LSTM‑met‑aandacht model op de gegeven DataFrame.
 
     Parameters
@@ -351,7 +385,7 @@ def train_model(df: pd.DataFrame,
 
     Returns
     -------
-    Tuple[LSTMWithAttention, StandardScaler]
+    Tuple[LSTMWithAttention, SimpleScaler]
         Het getrainde model en de scaler die gebruikt is om de features te schalen.
     """
     if device is None:
@@ -359,9 +393,9 @@ def train_model(df: pd.DataFrame,
 
     # Definieer feature‑kolommen: alle niet‑target kolommen behalve timestamp
     feature_cols = [c for c in df.columns if c not in ['timestamp', 'value']]
-    # Normaliseer features
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(df[feature_cols])
+    # Normaliseer features met SimpleScaler
+    scaler = SimpleScaler()
+    features_scaled = scaler.fit_transform(df[feature_cols].values)
     df_scaled = df.copy()
     df_scaled[feature_cols] = features_scaled
 
@@ -413,7 +447,7 @@ def train_model(df: pd.DataFrame,
 
 
 def predict_future(model: LSTMWithAttention,
-                   scaler: StandardScaler,
+                   scaler: SimpleScaler,
                    df: pd.DataFrame,
                    input_window: int = 96,
                    feature_cols: Optional[List[str]] = None,
@@ -424,7 +458,7 @@ def predict_future(model: LSTMWithAttention,
     ----------
     model : LSTMWithAttention
         Het getrainde model.
-    scaler : StandardScaler
+    scaler : SimpleScaler
         De scaler die gebruikt is om de features te schalen.
     df : pd.DataFrame
         DataFrame met de samengevoegde features die `input_window` stappen
@@ -451,7 +485,7 @@ def predict_future(model: LSTMWithAttention,
         feature_cols = [c for c in df.columns if c not in ['timestamp', 'value']]
     # Schaal features
     df_scaled = df.copy()
-    df_scaled[feature_cols] = scaler.transform(df_scaled[feature_cols])
+    df_scaled[feature_cols] = scaler.transform(df_scaled[feature_cols].values)
     # Alleen laatste `input_window` rijen gebruiken
     input_seq = df_scaled[feature_cols].tail(input_window).values
     X = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
