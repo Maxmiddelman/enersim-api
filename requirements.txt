@@ -4,4 +4,4 @@ requests
 supabase
 pandas
 numpy
-torch==2.0.1  # of een andere recente versie
+torch==2.7.1
