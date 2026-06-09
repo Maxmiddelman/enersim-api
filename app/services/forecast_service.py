@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -141,6 +141,53 @@ def _estimate_ev_baseline(measurements: pd.DataFrame) -> np.ndarray:
         return np.zeros(96)
 
 
+def _fallback_load_forecast(measurements: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Maak een eenvoudige load-voorspelling wanneer er onvoldoende data is voor het LSTM-model.
+
+    De fallback gebruikt een gemiddeld verbruiksprofiel per kwartier van de dag.
+    Als er te weinig data of geen kolom `power_kw` is, wordt een vlakke nulvoorspelling
+    teruggegeven.  Voor een eenvoudige confidence interval wordt één standaardafwijking
+    boven en onder het gemiddelde genomen; ontbrekende kwartieren krijgen het globale
+    gemiddelde en standaardafwijking.
+
+    Parameters
+    ----------
+    measurements : pd.DataFrame
+        Historische kwartierdata met kolommen `ts_utc` (tijdstempel) en
+        `power_kw` (vermogen).
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, np.ndarray]
+        Een tuple van (load_fc, lower, upper) met lengte 96 (dag ahead in
+        kwartieren).
+    """
+    if measurements.empty or 'power_kw' not in measurements.columns:
+        load_fc = np.zeros(96)
+        return load_fc, load_fc.copy(), load_fc.copy()
+    df = measurements.copy()
+    # Zorg dat de tijdstempel een datetime is
+    df['ts_utc'] = pd.to_datetime(df['ts_utc'], utc=True)
+    # Bereken kwartierindex binnen de dag (0-95)
+    df['quarter_index'] = df['ts_utc'].dt.hour * 4 + df['ts_utc'].dt.minute // 15
+    grouped = df.groupby('quarter_index')['power_kw']
+    mean_per_q = grouped.mean()
+    std_per_q = grouped.std().fillna(0)
+    # Gebruik globale gemiddelde en std voor ontbrekende kwartieren
+    global_mean = mean_per_q.mean() if not mean_per_q.empty else 0.0
+    global_std = std_per_q.mean() if not std_per_q.empty else 0.0
+    load_fc = np.zeros(96)
+    lower = np.zeros(96)
+    upper = np.zeros(96)
+    for q in range(96):
+        m = mean_per_q.get(q, global_mean)
+        s = std_per_q.get(q, global_std)
+        load_fc[q] = m
+        lower[q] = max(m - s, 0.0)
+        upper[q] = m + s
+    return _sanitize_array(load_fc), _sanitize_array(lower), _sanitize_array(upper)
+
+
 def train_models_for_site(site_id: str) -> Dict[str, Any]:
     """Train het load-voorspellingsmodel voor een locatie en sla op in de cache."""
     now = datetime.now(timezone.utc)
@@ -199,28 +246,32 @@ def run_forecast_for_site(site_id: str) -> Dict[str, Any]:
     df_local = measurements.rename(columns={'ts_utc': 'timestamp', 'power_kw': 'value'})
     # Prepareer features van de historische data
     df_prepared = processor.prepare_features(df_local)
+    # Als er onvoldoende data is na feature-engineering, gebruik een fallback voorspelling
     if df_prepared.empty:
-        return {"error": "onvoldoende data na feature-engineering", "site_id": site_id}
-    # Iteratieve voorspelling
-    load_fc: List[float] = []
-    last_df = df_prepared.copy()
-    for _ in range(96):
-        pred = predict_future(model, scaler, last_df)
-        load_fc.append(float(pred[0]))
-        # Maak nieuwe tijdstempel 15 minuten verder
-        next_ts = last_df['timestamp'].iloc[-1] + pd.Timedelta(minutes=15)
-        # Bouw een nieuwe rij met predicted value
-        new_row = pd.DataFrame({'timestamp': [next_ts], 'value': [pred[0]]})
-        new_row = processor.add_time_features(new_row)
-        # Lags berekenen door nieuwe rij op bestaande df te concateneren
-        # Voeg ontbrekende lagkolommen toe met NaN; DataProcessor update later
-        for lag in processor.lags:
-            new_row[f'lag_{lag}'] = np.nan
-        # Combineer en update lags; keep only laatste gedeelte
-        last_df = pd.concat([last_df, new_row], ignore_index=True)
-        last_df = processor.add_lag_features(last_df)
-        last_df = last_df.dropna().reset_index(drop=True)
-    load_fc_array = _sanitize_array(np.array(load_fc))
+        load_fc_array, lower, upper = _fallback_load_forecast(measurements)
+    else:
+        # Iteratieve voorspelling met het getrainde model
+        load_fc: List[float] = []
+        last_df = df_prepared.copy()
+        for _ in range(96):
+            pred = predict_future(model, scaler, last_df)
+            load_fc.append(float(pred[0]))
+            # Maak nieuwe tijdstempel 15 minuten verder
+            next_ts = last_df['timestamp'].iloc[-1] + pd.Timedelta(minutes=15)
+            # Bouw een nieuwe rij met predicted value
+            new_row = pd.DataFrame({'timestamp': [next_ts], 'value': [pred[0]]})
+            new_row = processor.add_time_features(new_row)
+            # Voeg ontbrekende lagkolommen toe met NaN; DataProcessor update later
+            for lag in processor.lags:
+                new_row[f'lag_{lag}'] = np.nan
+            # Combineer en update lags
+            last_df = pd.concat([last_df, new_row], ignore_index=True)
+            last_df = processor.add_lag_features(last_df)
+            last_df = last_df.dropna().reset_index(drop=True)
+        load_fc_array = _sanitize_array(np.array(load_fc))
+        # Geen confidence-berekening voor het model; zet op nul
+        lower = np.zeros_like(load_fc_array)
+        upper = np.zeros_like(load_fc_array)
 
     # PV- en EV-forecast behouden zoals eerder
     weather_fc = _fetch_weather_forecast(site_id, now - timedelta(hours=1), horizon_end)
@@ -230,9 +281,6 @@ def run_forecast_for_site(site_id: str) -> Dict[str, Any]:
     metadata = None
     pv_fc = _estimate_pv_from_weather(weather_fc, metadata)
     ev_fc = _estimate_ev_baseline(measurements)
-    # Voorlopig geen confidence-berekening; stel op nul
-    lower = np.zeros_like(load_fc_array)
-    upper = np.zeros_like(load_fc_array)
     # Sla resultaten op in database
     _save_forecast(site_id, load_fc_array, pv_fc, ev_fc, lower, upper, cache["model_id"])
     return {
@@ -276,3 +324,4 @@ def _save_forecast(site_id: str, load_fc: np.ndarray, pv_fc: np.ndarray, ev_fc: 
             }
         })
     supabase.table("forecast_predictions_15m").upsert(rows).execute()
+
