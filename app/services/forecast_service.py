@@ -221,74 +221,90 @@ def train_models_for_site(site_id: str) -> Dict[str, Any]:
     }
 
 
-def run_forecast_for_site(site_id: str) -> Dict[str, Any]:
-    """Genereer een dag-ahead forecast voor een locatie en sla op in de database."""
-    # Zorg dat het model er is; train als nodig
-    if site_id not in MODEL_CACHE or "model" not in MODEL_CACHE[site_id]:
-        train_models_for_site(site_id)
-    cache = MODEL_CACHE.get(site_id)
-    if not cache:
-        return {"error": "model niet beschikbaar", "site_id": site_id}
-    model: LSTMWithAttention = cache["model"]
-    scaler = cache["scaler"]
-    processor: DataProcessor = cache["processor"]
-
-    # Bepaal tijdsintervallen
+def run_forecast_for_site(site_id: str):
     now = datetime.now(timezone.utc)
-    # Pak 1 week historie zodat minstens 96 stappen beschikbaar zijn
-    hist_start = now - timedelta(days=7)
+    hist_start = now - timedelta(days=60)
     horizon_end = now + timedelta(hours=24)
 
-    # Haal recente metingen op
     measurements = _fetch_measurements(site_id, hist_start, now)
-    if measurements.empty:
-        return {"error": "geen meetdata gevonden", "site_id": site_id}
-    df_local = measurements.rename(columns={'ts_utc': 'timestamp', 'power_kw': 'value'})
-    # Prepareer features van de historische data
-    df_prepared = processor.prepare_features(df_local)
-    # Als er onvoldoende data is na feature-engineering, gebruik een fallback voorspelling
-    if df_prepared.empty:
-        load_fc_array, lower, upper = _fallback_load_forecast(measurements)
-    else:
-        # Iteratieve voorspelling met het getrainde model
-        load_fc: List[float] = []
-        last_df = df_prepared.copy()
-        for _ in range(96):
-            pred = predict_future(model, scaler, last_df)
-            load_fc.append(float(pred[0]))
-            # Maak nieuwe tijdstempel 15 minuten verder
-            next_ts = last_df['timestamp'].iloc[-1] + pd.Timedelta(minutes=15)
-            # Bouw een nieuwe rij met predicted value
-            new_row = pd.DataFrame({'timestamp': [next_ts], 'value': [pred[0]]})
-            new_row = processor.add_time_features(new_row)
-            # Voeg ontbrekende lagkolommen toe met NaN; DataProcessor update later
-            for lag in processor.lags:
-                new_row[f'lag_{lag}'] = np.nan
-            # Combineer en update lags
-            last_df = pd.concat([last_df, new_row], ignore_index=True)
-            last_df = processor.add_lag_features(last_df)
-            last_df = last_df.dropna().reset_index(drop=True)
-        load_fc_array = _sanitize_array(np.array(load_fc))
-        # Geen confidence-berekening voor het model; zet op nul
-        lower = np.zeros_like(load_fc_array)
-        upper = np.zeros_like(load_fc_array)
-
-    # PV- en EV-forecast behouden zoals eerder
     weather_fc = _fetch_weather_forecast(site_id, now - timedelta(hours=1), horizon_end)
-    # Haal eventueel metadata op voor PV- en EV-forecast.  Indien deze functie
-    # elders in de code beschikbaar is kun je deze importeren.  Voor een
-    # eenvoudig voorbeeld laten we metadata leeg.
+
     metadata = None
     pv_fc = _estimate_pv_from_weather(weather_fc, metadata)
     ev_fc = _estimate_ev_baseline(measurements)
-    # Sla resultaten op in database
-    _save_forecast(site_id, load_fc_array, pv_fc, ev_fc, lower, upper, cache["model_id"])
+
+    model_id = "fallback_average_profile_v1"
+
+    try:
+        if not measurements.empty:
+            if site_id not in MODEL_CACHE or "model" not in MODEL_CACHE.get(site_id, {}):
+                train_result = train_models_for_site(site_id)
+                if "error" in train_result:
+                    raise RuntimeError(train_result["error"])
+
+            cache = MODEL_CACHE.get(site_id, {})
+            processor = cache.get("processor")
+            model = cache.get("model")
+            scaler = cache.get("scaler")
+
+            if processor and model and scaler:
+                df_local = measurements.rename(columns={
+                    "ts_utc": "timestamp",
+                    "power_kw": "value"
+                })
+
+                df_prepared = processor.prepare_features(df_local)
+
+                if len(df_prepared) >= 96:
+                    load_fc = []
+                    last_df = df_prepared.copy()
+
+                    for _ in range(96):
+                        pred = predict_future(model, scaler, last_df)
+                        pred_val = float(pred[0])
+                        load_fc.append(pred_val)
+
+                        next_ts = last_df["timestamp"].iloc[-1] + pd.Timedelta(minutes=15)
+                        new_row = pd.DataFrame({
+                            "timestamp": [next_ts],
+                            "value": [pred_val]
+                        })
+
+                        new_row = processor.add_time_features(new_row)
+
+                        for lag in processor.lags:
+                            new_row[f"lag_{lag}"] = np.nan
+
+                        last_df = pd.concat([last_df, new_row], ignore_index=True)
+                        last_df = processor.add_lag_features(last_df)
+                        last_df = last_df.dropna().reset_index(drop=True)
+
+                    load_fc = _sanitize_array(np.array(load_fc))
+                    lower = np.zeros_like(load_fc)
+                    upper = np.zeros_like(load_fc)
+                    model_id = cache.get("model_id", "improved_lstm_attention_v1")
+                else:
+                    load_fc, lower, upper = _fallback_load_forecast(measurements)
+            else:
+                load_fc, lower, upper = _fallback_load_forecast(measurements)
+        else:
+            load_fc = np.zeros(96)
+            lower = np.zeros(96)
+            upper = np.zeros(96)
+
+    except Exception as e:
+        print(f"[forecast] fallback used for site {site_id}: {e}")
+        load_fc, lower, upper = _fallback_load_forecast(measurements)
+
+    _save_forecast(site_id, load_fc, pv_fc, ev_fc, lower, upper, model_id)
+
     return {
         "site_id": site_id,
         "status": "forecast_created",
-        "model_id": cache["model_id"],
+        "model_id": model_id,
         "rows_written": 96,
         "weather_available": not weather_fc.empty,
+        "fallback_used": model_id == "fallback_average_profile_v1",
     }
 
 
