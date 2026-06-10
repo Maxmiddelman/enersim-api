@@ -125,28 +125,24 @@ class DataProcessor:
         if self.weather_cols is None:
             self.weather_cols = []
 
-    def aggregate(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Aggregates second‑level data to the specified frequency.
+def aggregate(self, df: pd.DataFrame) -> pd.DataFrame:
 
-        Expects the input DataFrame `df` to have at least columns `timestamp`
-        (datetime) and `value` (float) representing consumption.  Additional
-        columns are carried over via aggregation (mean).
+    if df.empty:
+        return df
 
-        Returns a new DataFrame indexed on the aggregated timestamp.
-        """
-        df = df.copy()
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        # Set timestamp as index and resample
-        df = df.set_index('timestamp').sort_index()
-        # Compute mean for all numeric columns for the given frequency
-numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.set_index("timestamp")
 
-if not numeric_cols:
-    return pd.DataFrame(columns=["timestamp", "value"])
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-agg_df = df[numeric_cols].resample(self.freq).mean()
-        agg_df = agg_df.reset_index()
-        return agg_df
+    if not numeric_cols:
+        return pd.DataFrame(columns=["timestamp", "value"])
+
+    agg_df = df[numeric_cols].resample(self.freq).mean()
+    agg_df = agg_df.reset_index()
+
+    return agg_df
 
     def add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Voegt tijd‑ en seizoenskenmerken toe aan de DataFrame.
