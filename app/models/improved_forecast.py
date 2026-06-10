@@ -35,7 +35,7 @@ Gebruik:
   # Laad ruwe seconde‑data (timestamp, value, etc.)
   df_raw = pd.read_csv('sensor_data.csv', parse_dates=['timestamp'])
   # Maak een DataProcessor aan met benodigde instellingen
-  processor = DataProcessor(freq='15T', lags=[1, 4, 8, 12], weather_cols=['ghi', 'temperature'])
+  processor = DataProcessor(freq='15min', lags=[1, 4, 8, 12], weather_cols=['ghi', 'temperature'])
   df_features = processor.prepare_features(df_raw)
   # Train het model
   model, scaler = train_model(df_features, input_window=96, output_window=96, epochs=10)
@@ -115,7 +115,7 @@ class DataProcessor:
 
     """
 
-    freq: str = '15T'
+    freq: str = '15min'
     lags: List[int] = None
     weather_cols: Optional[List[str]] = None
 
@@ -229,8 +229,11 @@ class DataProcessor:
         pd.DataFrame
             DataFrame met tijdfeatures voor de toekomst.
         """
-        last_ts = pd.to_datetime(df['timestamp'].iloc[-1])
-        future_times = pd.date_range(start=last_ts + pd.to_timedelta(self.freq),
+    if df.empty:
+        return pd.DataFrame()
+
+    last_ts = pd.to_datetime(df['timestamp'].iloc[-1])
+    future_times = pd.date_range(start=last_ts + pd.to_timedelta(self.freq),
                                      periods=periods,
                                      freq=self.freq)
         future_df = pd.DataFrame({'timestamp': future_times})
@@ -403,6 +406,11 @@ def train_model(df: pd.DataFrame,
     # Splits train en val
     train_df, val_df = split_train_val(df_scaled)
     X_train, y_train = create_sequences(train_df, input_window, output_window, feature_cols)
+    if len(X_train) == 0:
+        raise ValueError(
+            f"Onvoldoende data voor training. "
+            f"Minimaal {input_window + output_window} kwartieren nodig."
+        )
     X_val, y_val = create_sequences(val_df, input_window, output_window, feature_cols)
     # Converteer naar tensors
     X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
@@ -414,8 +422,9 @@ def train_model(df: pd.DataFrame,
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    best_val_loss = float('inf')
-    patience = 5
+best_val_loss = float('inf')
+best_state = model.state_dict()
+patience = 5
     patience_counter = 0
     for epoch in range(epochs):
         model.train()
@@ -489,6 +498,10 @@ def predict_future(model: LSTMWithAttention,
     df_scaled[feature_cols] = scaler.transform(df_scaled[feature_cols].values)
     # Alleen laatste `input_window` rijen gebruiken
     input_seq = df_scaled[feature_cols].tail(input_window).values
+    if len(df_scaled) < input_window:
+        raise ValueError(
+            f"Minimaal {input_window} records nodig voor voorspelling."
+    )
     X = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
         pred = model(X)
