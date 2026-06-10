@@ -233,11 +233,11 @@ class DataProcessor:
         pd.DataFrame
             DataFrame met tijdfeatures voor de toekomst.
         """
-    if df.empty:
-        return pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame()
 
-    last_ts = pd.to_datetime(df['timestamp'].iloc[-1])
-    future_times = pd.date_range(start=last_ts + pd.to_timedelta(self.freq),
+        last_ts = pd.to_datetime(df['timestamp'].iloc[-1])
+        future_times = pd.date_range(start=last_ts + pd.to_timedelta(self.freq),
                                      periods=periods,
                                      freq=self.freq)
         future_df = pd.DataFrame({'timestamp': future_times})
@@ -426,9 +426,9 @@ def train_model(df: pd.DataFrame,
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-best_val_loss = float('inf')
-best_state = model.state_dict()
-patience = 5
+    best_val_loss = float('inf')
+    best_state = model.state_dict()
+    patience = 5
     patience_counter = 0
     for epoch in range(epochs):
         model.train()
@@ -505,7 +505,7 @@ def predict_future(model: LSTMWithAttention,
     if len(df_scaled) < input_window:
         raise ValueError(
             f"Minimaal {input_window} records nodig voor voorspelling."
-    )
+        )
     X = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
         pred = model(X)
