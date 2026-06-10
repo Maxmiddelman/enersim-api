@@ -139,7 +139,12 @@ class DataProcessor:
         # Set timestamp as index and resample
         df = df.set_index('timestamp').sort_index()
         # Compute mean for all numeric columns for the given frequency
-        agg_df = df.resample(self.freq).mean()
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+if not numeric_cols:
+    return pd.DataFrame(columns=["timestamp", "value"])
+
+agg_df = df[numeric_cols].resample(self.freq).mean()
         agg_df = agg_df.reset_index()
         return agg_df
 
