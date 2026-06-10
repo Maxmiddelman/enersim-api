@@ -125,24 +125,24 @@ class DataProcessor:
         if self.weather_cols is None:
             self.weather_cols = []
 
-def aggregate(self, df: pd.DataFrame) -> pd.DataFrame:
+    def aggregate(self, df: pd.DataFrame) -> pd.DataFrame:
 
-    if df.empty:
-        return df
+        if df.empty:
+            return df
 
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.set_index("timestamp")
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.set_index("timestamp")
 
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-    if not numeric_cols:
-        return pd.DataFrame(columns=["timestamp", "value"])
+        if not numeric_cols:
+            return pd.DataFrame(columns=["timestamp", "value"])
 
-    agg_df = df[numeric_cols].resample(self.freq).mean()
-    agg_df = agg_df.reset_index()
+        agg_df = df[numeric_cols].resample(self.freq).mean()
+        agg_df = agg_df.reset_index()
 
-    return agg_df
+        return agg_df
 
     def add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Voegt tijd‑ en seizoenskenmerken toe aan de DataFrame.
