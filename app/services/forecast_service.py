@@ -197,7 +197,7 @@ def train_models_for_site(site_id: str) -> Dict[str, Any]:
     if df.empty:
         return {"error": "geen meetdata gevonden"}
     # DataProcessor aanmaken; configureer lags en eventuele weerkolommen
-    processor = DataProcessor(freq='15T', lags=[1, 4, 8, 12])
+    processor = DataProcessor(freq='15min', lags=[1, 4, 8, 12])
     # Hernoem kolommen zodat DataProcessor ze herkent
     df_local = df.rename(columns={'ts_utc': 'timestamp', 'power_kw': 'value'})
     df_prepared = processor.prepare_features(df_local)
