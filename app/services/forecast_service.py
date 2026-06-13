@@ -261,10 +261,10 @@ def run_forecast_for_site(site_id: str) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     # Zorg dat model in cache staat; train indien niet aanwezig
     if site_id not in MODEL_CACHE:
-    return {
-        "error": "Model not trained. Run /train first before calling /forecast.",
-        "site_id": site_id
-    }
+        return {
+            "error": "Model not trained. Run /train first before calling /forecast.",
+            "site_id": site_id
+        }
 
     cache = MODEL_CACHE.get(site_id, {})
     load_model: Optional[LoadLSTMForecaster] = cache.get("load_model")
