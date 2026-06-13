@@ -6,6 +6,11 @@ WEATHER_VARS = [
     "temperature_2m",
     "cloud_cover",
     "shortwave_radiation",
+    "direct_radiation",
+    "diffuse_radiation",
+    "wind_speed_10m",
+    "precipitation",
+    "sunshine_duration",
 ]
 
 
@@ -40,9 +45,17 @@ def save_weather(site_id, payload):
         rows.append({
             "site_id": site_id,
             "timestamp": ts,
+
             "temperature_2m": hourly["temperature_2m"][i],
             "cloud_cover": hourly["cloud_cover"][i],
+
             "shortwave_radiation": hourly["shortwave_radiation"][i],
+            "direct_radiation": hourly["direct_radiation"][i],
+            "diffuse_radiation": hourly["diffuse_radiation"][i],
+
+            "wind_speed_10m": hourly["wind_speed_10m"][i],
+            "precipitation": hourly["precipitation"][i],
+            "sunshine_duration": hourly["sunshine_duration"][i]
         })
 
     if rows:
